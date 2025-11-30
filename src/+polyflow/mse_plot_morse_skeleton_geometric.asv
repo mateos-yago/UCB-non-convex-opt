@@ -1,0 +1,400 @@
+
+
+
+function mse_plot_morse_skeleton_geometric(M, info, opts)
+%MSE_PLOT_MORSE_SKELETON_GEOMETRIC  Plot Morse skeleton (stable/unstable manifolds)
+%   using a geometric arclength-based integrator.
+%
+%   mse_plot_morse_skeleton_geometric(M, info, opts)
+%
+%   Inputs:
+%       M    : model with fields
+%               M.L(a,b), M.gradL(a,b), M.hessL(a,b)
+%       info : struct from mse_morse_info with field fixed_points (array of
+%              structs with fields: a, b, type ('min','saddle',...), H (2x2))
+%       opts : struct with fields (defaults in trace function if missing):
+%               .ds_sep, .max_steps_sep, .sep_eps
+%               .a_min, .a_max, .b_min, .b_max
+%               .min_speed, .use_curvature_adapt, .N_turns, .kappa_floor
+%               .capture_radius_min, .grad_tol_min
+%               .newton (unused here but passed through if needed)
+%               .debug
+
+    if nargin < 3, opts = struct(); end
+
+    if ~isfield(info, 'fixed_points') || isempty(info.fixed_points)
+        warning('mse_plot_morse_skeleton_geometric:NoFixedPoints', ...
+            'No fixed points in info.fixed_points; nothing to draw.');
+        return;
+    end
+
+    fps = info.fixed_points;
+
+    % --- Extract minima and saddles --------------------------------------
+    is_min    = arrayfun(@(s) isfield(s,'type') && strcmpi(s.type,'min'), fps);
+    is_saddle = arrayfun(@(s) isfield(s,'type') && strcmpi(s.type,'saddle'), fps);
+
+    mins   = fps(is_min);
+    sadds  = fps(is_saddle);
+
+    if isempty(sadds)
+        warning('mse_plot_morse_skeleton_geometric:NoSaddles', ...
+            'No saddles found; Morse skeleton is empty.');
+        return;
+    end
+
+    % Minima locations and values
+    minA = [mins.a].';
+    minB = [mins.b].';
+    nMin = numel(mins);
+
+    minL = zeros(nMin,1);
+    for k = 1:nMin
+        minL(k) = M.L(minA(k), minB(k));
+    end
+
+    % Saddle locations and values
+    saddA = [sadds.a].';
+    saddB = [sadds.b].';
+    nSadd = numel(sadds);
+
+    saddL = zeros(nSadd,1);
+    for k = 1:nSadd
+        saddL(k) = M.L(saddA(k), saddB(k));
+    end
+
+    % For each saddle we will:
+    %   - eigen-decompose H
+    %   - identify unstable and stable eigenvectors for descent flow
+    %   - create 4 branches: 2 unstable (descent), 2 stable (ascent)
+
+    % We will collect branches into an array of structs
+    branches = [];
+
+    for j = 1:nSadd
+        s = sadds(j);
+
+        if ~isfield(s, 'H')
+            Hs = M.hessL(s.a, s.b);
+        else
+            Hs = s.H;
+        end
+
+        [V,D] = eig(Hs);
+        lam   = diag(D);
+
+        % For gradient descent flow: F = -gradL,
+        %   - eigenvalues of H >0 => stable directions
+        %   - eigenvalues of H <0 => unstable directions
+        %
+        % We identify one positive and one negative (Morse saddle).
+        [lam_min, idx_unst] = min(lam);
+        [lam_max, idx_stab] = max(lam);
+
+        v_unst = V(:, idx_unst);
+        v_stab = V(:, idx_stab);
+
+        % Normalize eigenvectors for cleaner initialization
+        v_unst = v_unst / norm(v_unst);
+        v_stab = v_stab / norm(v_stab);
+
+        % Saddle data
+        y_s        = [s.a; s.b];
+        L_saddle_j = saddL(j);
+
+        % Common minima data table for branches
+        branch_template.minA      = minA;
+        branch_template.minB      = minB;
+        branch_template.minL      = minL;
+        branch_template.L_saddle  = L_saddle_j;
+        branch_template.y_saddle  = y_s;
+        branch_template.saddle_ix = j;
+
+        % ----- UNSTABLE branches (descent) -------------------------------
+        % Flow: y' = -gradL (flow_sign = -1)
+        % Two branches: ±v_unst
+        for sign_dir = [+1, -1]
+            b = branch_template;
+            b.branch_kind = 'unstable_descent';
+            b.flow_sign   = -1;              % descent
+            b.eigvec      = sign_dir * v_unst;
+
+            % Determine target minimum index in the direction of eigvec
+            [target_idx, to_infinity] = choose_target_minimum( ...
+                y_s, b.eigvec, minA, minB);
+
+            if to_infinity
+                b.has_target = false;
+                b.target_idx = NaN;
+            else
+                b.has_target = true;
+                b.target_idx = target_idx;
+            end
+
+            branches = [branches, b]; %#ok<AGROW>
+        end
+
+        % ----- STABLE branches (ascent) ----------------------------------
+        % Stable manifold of descent is unstable manifold of ascent:
+        %   descent:  y' = -gradL
+        %   ascent:   y' = +gradL (flow_sign = +1)
+        % Two branches: ±v_stab
+        for sign_dir = [+1, -1]
+            b = branch_template;
+            b.branch_kind = 'stable_ascent';
+            b.flow_sign   = +1;              % ascent
+            b.eigvec      = sign_dir * v_stab;
+
+            % For stable branches we do NOT need a target minimum.
+            b.has_target = false;
+            b.target_idx = NaN;
+
+            branches = [branches, b]; %#ok<AGROW>
+        end
+    end
+
+    % --- Trace and plot each branch --------------------------------------
+    for k = 1:numel(branches)
+        [Y, term_reason] = trace_branch_geometric(M, branches(k), opts);
+
+        if size(Y,2) < 2
+            continue; % nothing to draw
+        end
+
+        switch branches(k).branch_kind
+            case 'unstable_descent'
+                col = 'g-';  % saddle connections (unstable manifolds) in green
+            case 'stable_ascent'
+                col = 'r-';  % stable manifolds of descent (separatrices) in red
+            otherwise
+                col = 'k-';
+        end
+
+        % Draw the polyline
+        % plot(Y(1,:), Y(2,:), col, 'LineWidth', 2); hold on;
+
+        % Smooth the curve:
+        plot(0.5*(Y(1, 1:end-1)+Y(1, 2:)))
+
+        % If this unstable branch has no finite target, we may add an arrow
+        if strcmp(branches(k).branch_kind, 'unstable_descent') && ~branches(k).has_target
+            % crude arrow at the end pointing roughly in the last tangent
+            Yend   = Y(:,end);
+            Yprev  = Y(:,max(1,end-1));
+            dir_v  = Yend - Yprev;
+            if norm(dir_v) > 0
+                dir_v = dir_v / norm(dir_v);
+                L_arrow = 0.05 * max( ...
+                    [opts.a_max-opts.a_min, opts.b_max-opts.b_min]);
+                quiver(Yend(1), Yend(2), ...
+                       L_arrow*dir_v(1), L_arrow*dir_v(2), ...
+                       0, 'Color', col(1), 'MaxHeadSize', 2, 'LineWidth', 1);
+            end
+        end
+
+        if isfield(opts,'debug') && opts.debug
+            fprintf('[Skel] Branch %d (%s) terminated: %s\n', ...
+                k, branches(k).branch_kind, term_reason);
+        end
+    end
+end
+
+%==========================================================================%
+% Choose a target minimum index in the direction of initial eigenvector
+%==========================================================================%
+function [idx, to_infinity] = choose_target_minimum(y_s, eigvec, minA, minB)
+%CHOOSE_TARGET_MINIMUM  Choose minimum in direction of eigvec from y_s.
+%
+%   We pick the minimum whose vector from the saddle has the largest
+%   positive cosine with the initial direction. If no minima lie in the
+%   forward half-plane, we treat this branch as "going to infinity".
+
+    dir0 = eigvec(:);
+    dir0 = dir0 / norm(dir0);
+
+    Ys = y_s(:);
+    nMin = numel(minA);
+
+    cosvals = -inf(nMin,1);
+    for i = 1:nMin
+        d = [minA(i); minB(i)] - Ys;
+        nd = norm(d);
+        if nd == 0
+            cosvals(i) = 1;  % exactly at min (degenerate), but fine
+        else
+            cosvals(i) = (dir0' * d) / nd;
+        end
+    end
+
+    [cmax, idx] = max(cosvals);
+
+    if cmax <= 0
+        % No minimum in "forward" half-plane; this branch aims at infinity.
+        to_infinity = true;
+        idx = NaN;
+    else
+        to_infinity = false;
+    end
+end
+
+%==========================================================================%
+% Geometric arclength-based tracer with shaping using fixed target_idx
+%==========================================================================%
+function [Y, term_reason] = trace_branch_geometric(M, branch, opts)
+%TRACE_BRANCH_GEOMETRIC  Trace a single branch of the Morse skeleton.
+%
+%   [Y, term_reason] = trace_branch_geometric(M, branch, opts)
+%
+%   branch fields:
+%       branch_kind : 'unstable_descent' or 'stable_ascent'
+%       flow_sign   : -1 (descent) or +1 (ascent)
+%       eigvec      : initial direction at saddle (2x1)
+%       y_saddle    : [a_s; b_s]
+%       L_saddle    : L at the saddle
+%       minA, minB, minL : arrays of minima
+%       has_target  : logical
+%       target_idx  : index into minA/minB/minL (if has_target)
+%
+%   opts fields (with defaults here):
+%       ds_sep, max_steps_sep, sep_eps
+%       a_min, a_max, b_min, b_max
+%       min_speed
+%       use_curvature_adapt, N_turns, kappa_floor
+%       capture_radius_min, grad_tol_min
+%       debug (optional)
+
+    if nargin < 3, opts = struct(); end
+
+    % Defaults
+    if ~isfield(opts, 'ds_sep'),            opts.ds_sep            = 0.02;   end
+    if ~isfield(opts, 'max_steps_sep'),     opts.max_steps_sep     = 1e5;    end
+    if ~isfield(opts, 'sep_eps'),           opts.sep_eps           = 1e-2;   end
+
+    if ~isfield(opts, 'a_min'),             opts.a_min             = -6;     end
+    if ~isfield(opts, 'a_max'),             opts.a_max             =  6;     end
+    if ~isfield(opts, 'b_min'),             opts.b_min             = -6;     end
+    if ~isfield(opts, 'b_max'),             opts.b_max             =  6;     end
+
+    if ~isfield(opts, 'min_speed'),         opts.min_speed         = 1e-6;  end
+    if ~isfield(opts, 'use_curvature_adapt'),opts.use_curvature_adapt = true;end
+    if ~isfield(opts, 'N_turns'),           opts.N_turns           = 24;     end
+    if ~isfield(opts, 'kappa_floor'),       opts.kappa_floor       = 1e-6;   end
+
+    if ~isfield(opts, 'capture_radius_min'),opts.capture_radius_min = 0.1;   end
+    if ~isfield(opts, 'grad_tol_min'),      opts.grad_tol_min       = 1e-4;  end
+
+    if ~isfield(opts, 'debug'),             opts.debug = false;             end
+
+    ds      = opts.ds_sep;
+    maxStep = opts.max_steps_sep;
+    dtheta_target = 2*pi / opts.N_turns;
+
+    % Initialize Y
+    Y = zeros(2, maxStep+1);
+    Y(:,1) = branch.y_saddle + opts.sep_eps * branch.eigvec(:);
+
+    term_reason = 'max_steps';
+
+    for k = 1:maxStep
+        y = Y(:,k);
+        a = y(1); b = y(2);
+
+        % Gradient and Hessian of original L
+        g = M.gradL(a, b);
+        H = M.hessL(a, b);
+
+        % Base flow direction
+        v = branch.flow_sign * g;    % ± gradL
+
+        % --- Optional shaping for unstable descent branches with target ---
+        if strcmp(branch.branch_kind, 'unstable_descent') && branch.has_target
+            Ly    = M.L(a, b);
+            idx_t = branch.target_idx;
+
+            L_min  = branch.minL(idx_t);
+            dL_tot = branch.L_saddle - L_min;
+
+            % c chosen as small fraction of total drop, to keep scaling sane
+            beta_shape = 0.1;
+            c_shape    = max(beta_shape * dL_tot, eps);
+
+            dL_here = max(Ly - L_min, 0);   % prevent tiny negative from roundoff
+            alpha   = 1.0 / (c_shape + dL_here);
+
+            % clamp scaling to avoid insane values
+            alpha_max = 1e3;
+            alpha_min = 1e-3;
+            alpha = max(min(alpha, alpha_max), alpha_min);
+
+            v = alpha * v;
+        end
+
+        speed = norm(v);
+        if speed < opts.min_speed
+            term_reason = 'min_speed';
+            Y = Y(:,1:k);
+            return;
+        end
+
+        % Curvature of shaped flow
+        a_vec = H * v;
+        cross2 = v(1)*a_vec(2) - v(2)*a_vec(1);
+        kappa  = abs(cross2) / max(speed^3, eps);
+        if kappa < opts.kappa_floor
+            kappa = opts.kappa_floor;
+        end
+
+        % Arclength step (optionally curvature-adaptive)
+        if opts.use_curvature_adapt
+            ds_kappa = dtheta_target / max(kappa * speed, eps);
+            ds_here  = min(ds, ds_kappa);
+        else
+            ds_here  = ds;
+        end
+
+        dir = v / speed;
+        y_next = y + ds_here * dir;
+
+        Y(:,k+1) = y_next;
+
+        % --- termination tests -------------------------------------------
+
+        % 1) Box exit
+        if y_next(1) < opts.a_min || y_next(1) > opts.a_max || ...
+           y_next(2) < opts.b_min || y_next(2) > opts.b_max
+            term_reason = 'box_exit';
+            Y = Y(:,1:(k+1));
+            return;
+        end
+
+        % 2) If unstable branch with finite target: check proximity to target
+        if strcmp(branch.branch_kind, 'unstable_descent') && branch.has_target
+            idx_t = branch.target_idx;
+            y_min = [branch.minA(idx_t); branch.minB(idx_t)];
+
+            dist_to_min = norm(y_next - y_min);
+
+            Ly    = M.L(y_next(1), y_next(2));
+            L_min = branch.minL(idx_t);
+            % Very tight L-based tolerance (vision-level closeness)
+            L_tol = 1e-10 * max(1, abs(branch.L_saddle));
+
+            if (dist_to_min <= opts.capture_radius_min && ...
+                abs(Ly - L_min) <= L_tol)
+
+                term_reason = 'hit_min';
+                % snap visually to exact minimum
+                Y(:,k+1) = y_min;
+                Y = Y(:,1:(k+1));
+                return;
+            end
+        end
+    end
+
+    % If we get here, used up all steps
+    Y = Y(:,1:end);
+end
+
+
+
+    
